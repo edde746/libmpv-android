@@ -10,6 +10,9 @@ for dep_path in "${PATCHES[@]}"; do
         cd deps/$dep
         echo Patching $dep
         git reset --hard
+        # Patches may create files; reset --hard leaves those untracked and a
+        # re-run would fail on "already exists". Keep the untracked build trees.
+        git clean -fd -e '_build*'
         for patch in "${patches[@]}"; do
             echo Applying $patch
             git apply "$ROOT/$patch"
