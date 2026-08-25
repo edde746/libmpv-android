@@ -31,8 +31,9 @@ if [ ! -d libunibreak ]; then
 		tar -xz -C libunibreak --strip-components=1
 fi
 
-# libass
-[ ! -d libass ] && git clone --depth 1 --branch $v_libass https://github.com/libass/libass.git libass
+# libass (edde746 fork: upstream 0.17.4 + render-path optimizations, versioned 0.18.x;
+# same fork the Plezy Android ExoPlayer subtitle module consumes as prebuilts)
+[ ! -d libass ] && git clone --depth 1 --branch $v_libass https://github.com/edde746/libass.git libass
 
 # lua
 if [ ! -d lua ]; then
