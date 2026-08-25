@@ -74,6 +74,7 @@ setup_prefix () {
 [built-in options]
 prefix = '/usr'
 buildtype = 'release'
+b_ndebug = 'true'
 default_library = 'static'
 wrap_mode = 'nodownload'
 [binaries]
