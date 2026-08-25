@@ -31,6 +31,7 @@ cpuflags=
 	--disable-static --enable-shared --enable-{gpl,version3} \
 	--disable-{stripping,doc,programs} \
 	--disable-{muxers,encoders,devices,filters} \
+	--enable-muxer=spdif \
 	--enable-filter=loudnorm \
 	--disable-v4l2-m2m
 
