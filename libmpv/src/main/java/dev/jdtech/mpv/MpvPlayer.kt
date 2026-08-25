@@ -129,6 +129,8 @@ class MpvPlayer private constructor() : AutoCloseable {
         @JvmStatic private external fun nativeSetOptionString(name: String, value: String): Int
         @JvmStatic private external fun nativeAttachSurface(surface: Surface)
         @JvmStatic private external fun nativeDetachSurface()
+        @JvmStatic private external fun nativeAttachOsdSurface(surface: Surface)
+        @JvmStatic private external fun nativeDetachOsdSurface()
         @JvmStatic private external fun nativeGetPropertyInt(name: String): Int?
         @JvmStatic private external fun nativeGetPropertyDouble(name: String): Double?
         @JvmStatic private external fun nativeGetPropertyBoolean(name: String): Boolean?
@@ -167,6 +169,17 @@ class MpvPlayer private constructor() : AutoCloseable {
     fun detachSurface() {
         checkNotClosed()
         nativeDetachSurface()
+    }
+
+    /** OSD/subtitle plane for `vo=mediacodec`; attach before selecting the VO. */
+    fun attachOsdSurface(surface: Surface) {
+        checkNotClosed()
+        nativeAttachOsdSurface(surface)
+    }
+
+    fun detachOsdSurface() {
+        checkNotClosed()
+        nativeDetachOsdSurface()
     }
 
     // Property getters
