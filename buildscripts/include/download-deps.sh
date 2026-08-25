@@ -12,6 +12,18 @@ mkdir -p deps && cd deps
 # dav1d
 [ ! -d dav1d ] && git clone --depth 1 --branch $v_dav1d https://code.videolan.org/videolan/dav1d.git dav1d
 
+# libdovi (prebuilt static libs from edde746/libdovi-builds - the same
+# artifacts the Plezy Android ExoPlayer DV module consumes; the C API header
+# is vendored at include/libdovi/rpu_parser.h)
+if [ ! -d libdovi ]; then
+	mkdir libdovi
+	for triple in aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android; do
+		mkdir -p libdovi/$triple
+		$WGET https://github.com/edde746/libdovi-builds/releases/download/v$v_libdovi/libdovi-$triple.tar.gz -O - | \
+			tar -xz -C libdovi/$triple
+	done
+fi
+
 # ffmpeg
 [ ! -d ffmpeg ] && git clone --depth 1 --branch n$v_ffmpeg https://github.com/FFmpeg/FFmpeg.git ffmpeg
 

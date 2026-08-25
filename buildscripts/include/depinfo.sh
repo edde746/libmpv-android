@@ -16,6 +16,7 @@ v_fribidi=1.0.16
 v_freetype=2.14.1
 v_mbedtls=3.6.5
 v_libplacebo=7.360.0
+v_libdovi=2.3.1
 v_dav1d=1.5.3
 v_ffmpeg=8.0.1
 v_mpv=0.41.0
@@ -26,7 +27,7 @@ v_mpv=0.41.0
 
 dep_mbedtls=()
 dep_dav1d=()
-dep_ffmpeg=(mbedtls dav1d)
+dep_ffmpeg=(mbedtls dav1d libdovi)
 dep_freetype2=()
 dep_fribidi=()
 dep_harfbuzz=()
