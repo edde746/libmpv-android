@@ -61,6 +61,8 @@ jni_func(void, nativeAttachOsdSurface, jobject surface_) {
 
 jni_func(void, nativeDetachOsdSurface) {
     CHECK_MPV_INIT();
+    if (!osd_surface)
+        return;
 
     int64_t wid = 0;
     int result = mpv_set_option(g_mpv, "vo-mediacodec-osd-surface", MPV_FORMAT_INT64, &wid);
