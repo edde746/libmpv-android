@@ -2,6 +2,10 @@ package dev.jdtech.mpv
 
 import android.content.Context
 import android.view.Surface
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
@@ -49,27 +53,27 @@ class MpvPlayer private constructor() : AutoCloseable {
 
         @JvmStatic
         fun onPropertyChanged(name: String) {
-            instance.get()?.propertyChanges?.tryEmit(PropertyChange.None(name))
+            instance.get()?.rawPropertyChanges?.trySend(PropertyChange.None(name))
         }
 
         @JvmStatic
         fun onPropertyChanged(name: String, value: Boolean) {
-            instance.get()?.propertyChanges?.tryEmit(PropertyChange.Flag(name, value))
+            instance.get()?.rawPropertyChanges?.trySend(PropertyChange.Flag(name, value))
         }
 
         @JvmStatic
         fun onPropertyChanged(name: String, value: Long) {
-            instance.get()?.propertyChanges?.tryEmit(PropertyChange.Int64(name, value))
+            instance.get()?.rawPropertyChanges?.trySend(PropertyChange.Int64(name, value))
         }
 
         @JvmStatic
         fun onPropertyChanged(name: String, value: Double) {
-            instance.get()?.propertyChanges?.tryEmit(PropertyChange.Double(name, value))
+            instance.get()?.rawPropertyChanges?.trySend(PropertyChange.Double(name, value))
         }
 
         @JvmStatic
         fun onPropertyChanged(name: String, value: String) {
-            instance.get()?.propertyChanges?.tryEmit(
+            instance.get()?.rawPropertyChanges?.trySend(
                 PropertyChange.Str(name, sanitizeString(value)),
             )
         }
@@ -77,12 +81,12 @@ class MpvPlayer private constructor() : AutoCloseable {
         @JvmStatic
         fun onEvent(eventId: Int) {
             val event = MpvEvent.fromId(eventId) ?: return
-            instance.get()?.events?.tryEmit(event)
+            instance.get()?.rawEvents?.trySend(event)
         }
 
         @JvmStatic
         fun onEndFile(reason: Int) {
-            instance.get()?.events?.tryEmit(
+            instance.get()?.rawEvents?.trySend(
                 MpvEvent.EndFile(EndFileReason.fromId(reason)),
             )
         }
@@ -90,7 +94,7 @@ class MpvPlayer private constructor() : AutoCloseable {
         @JvmStatic
         fun onLogMessage(prefix: String, level: Int, text: String) {
             val logLevel = LogLevel.fromNative(level) ?: return
-            instance.get()?.logMessages?.tryEmit(
+            instance.get()?.rawLogMessages?.trySend(
                 LogMessage(prefix, logLevel, sanitizeString(text).trimEnd()),
             )
         }
@@ -144,9 +148,28 @@ class MpvPlayer private constructor() : AutoCloseable {
         internal fun setOptionString(name: String, value: String): Int = nativeSetOptionString(name, value)
     }
 
+    // The native event thread hands everything to unbounded channels: trySend
+    // on them cannot fail (until close) and cannot block mpv's event loop. A
+    // pump per stream re-emits into the SharedFlow, whose SUSPEND overflow
+    // parks the pump - not the native thread - while a collector catches up.
+    // The previous design tryEmit-ed straight into the 64-slot SharedFlow
+    // buffer, which silently dropped whatever arrived during a burst; losing
+    // e.g. the one cplayer log line that signals a failed video chain.
+    private val rawEvents = Channel<MpvEvent>(Channel.UNLIMITED)
+    private val rawPropertyChanges = Channel<PropertyChange>(Channel.UNLIMITED)
+    private val rawLogMessages = Channel<LogMessage>(Channel.UNLIMITED)
+
     private val events = MutableSharedFlow<MpvEvent>(extraBufferCapacity = 64)
     private val propertyChanges = MutableSharedFlow<PropertyChange>(extraBufferCapacity = 64)
     private val logMessages = MutableSharedFlow<LogMessage>(extraBufferCapacity = 64)
+
+    private val pumpScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    init {
+        pumpScope.launch { for (e in rawEvents) events.emit(e) }
+        pumpScope.launch { for (c in rawPropertyChanges) propertyChanges.emit(c) }
+        pumpScope.launch { for (m in rawLogMessages) logMessages.emit(m) }
+    }
 
     val eventFlow: SharedFlow<MpvEvent> = events.asSharedFlow()
     val propertyFlow: SharedFlow<PropertyChange> = propertyChanges.asSharedFlow()
@@ -283,6 +306,11 @@ class MpvPlayer private constructor() : AutoCloseable {
         if (instance.compareAndSet(this, null)) {
             nativeDestroy()
         }
+        // After nativeDestroy no callback can produce: closing the channels
+        // lets each pump drain what is already queued and then complete.
+        rawEvents.close()
+        rawPropertyChanges.close()
+        rawLogMessages.close()
     }
 
     private fun checkNotClosed() {
