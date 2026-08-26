@@ -1,17 +1,20 @@
 diff --git a/DOCS/man/vo.rst b/DOCS/man/vo.rst
-index 814e1e4..1fce088 100644
+index 814e1e4..b7d0cfb 100644
 --- a/DOCS/man/vo.rst
 +++ b/DOCS/man/vo.rst
-@@ -723,6 +723,20 @@ Available video output drivers are:
+@@ -723,6 +723,28 @@ Available video output drivers are:
          :yes:   Attempt to enable VRR, whether the capability is reported or not.
          :auto:  Attempt to enable VRR if support is reported.
  
 +``mediacodec`` (Android)
 +    Renders ``IMGFMT_MEDIACODEC`` frames directly to an ``android.view.Surface``
 +    with per-frame presentation timestamps, and renders subtitles/OSD into a
-+    second, transparent ``android.view.Surface``. Requires ``--hwdec=mediacodec``,
-+    ``--wid=(intptr_t)(*android.view.Surface)``, and, for OSD/subtitles,
++    second, transparent ``android.view.Surface``. Requires
++    ``--wid=(intptr_t)(*android.view.Surface)`` and, for OSD/subtitles,
 +    ``--vo-mediacodec-osd-surface=(intptr_t)(*android.view.Surface)``.
++    Hardware sessions require ``--hwdec=mediacodec`` (not ``-copy``); software
++    frames are rejected, since copying them in would connect the Surface as a
++    CPU producer and prevent a GL VO from binding it later.
 +
 +    The embedder owns geometry: the video Surface must be sized to the
 +    aspect-corrected video rectangle (decoded buffers are scaled to the whole
@@ -19,6 +22,11 @@ index 814e1e4..1fce088 100644
 +    same bounds. Since decoded buffers go straight to the system compositor,
 +    the decoder's dataspace (HDR) is preserved and no GPU pass runs, but
 +    video filters and screenshots are unavailable.
++
++    On Android 11+ the driver also votes the presentation frame rate on the
++    video Surface (``ANativeWindow_setFrameRate``, seamless-only), so the
++    compositor can match the display refresh; deliberate display-mode
++    switches remain the embedder's job.
 +
  ``mediacodec_embed`` (Android)
      Renders ``IMGFMT_MEDIACODEC`` frames directly to an ``android.view.Surface``.
@@ -57,10 +65,10 @@ index c9cde30..c8cb30e 100644
  #if HAVE_SDL2_VIDEO
 diff --git a/video/out/vo_mediacodec.c b/video/out/vo_mediacodec.c
 new file mode 100644
-index 0000000..95e4aec
+index 0000000..d92f185
 --- /dev/null
 +++ b/video/out/vo_mediacodec.c
-@@ -0,0 +1,382 @@
+@@ -0,0 +1,470 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -107,12 +115,15 @@ index 0000000..95e4aec
 + * VOCTRL_SET_PANSCAN and friends are not implemented, mirroring how the
 + * avfoundation VO leaves zoom to the embedding layer.
 + *
-+ * Requires --hwdec=mediacodec (not -copy): query_format accepts only
-+ * IMGFMT_MEDIACODEC. Software decoding needs a different VO; the embedder is
-+ * expected to switch VOs when it turns hardware decoding off.
++ * Hardware sessions require --hwdec=mediacodec (not -copy), whose frames go
++ * through the timed release path above. Software frames are refused
++ * (query_format): copying them in would connect the Surface as a CPU
++ * producer, which permanently prevents EGL from binding it, so the embedder
++ * must route a software-decoding session to a GL VO instead.
 + */
 +
-+#include <stdatomic.h>
++#include <dlfcn.h>
++#include <math.h>
 +#include <time.h>
 +
 +#include <android/native_window.h>
@@ -148,9 +159,73 @@ index 0000000..95e4aec
 +    bool osd_force_full;
 +    bool osd_missing_logged;
 +
++    // The wid Surface, for the frame-rate vote only. Never locked: a CPU
++    // producer connection would leave it unusable for EGL.
++    ANativeWindow *video_window;
++
++    // Seamless frame-rate vote (ANativeWindow_setFrameRate, API 30+).
++    float voted_fps;
++    int64_t last_vote_ns;
++    bool hint_failed;
++
 +    // options
 +    int64_t osd_surface;
 +};
++
++// ANativeWindow_setFrameRate is API 30+; resolved at runtime so the minSdk 25
++// (Fire OS 6) build keeps loading. Value from android/native_window.h.
++#define ANDROID_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE 1
++
++typedef int32_t (*mp_set_frame_rate_fn)(ANativeWindow *, float, int8_t);
++
++static mp_set_frame_rate_fn get_set_frame_rate(void)
++{
++    static mp_set_frame_rate_fn set_frame_rate;
++    static bool resolved;
++    if (!resolved) {
++        void *lib = dlopen("libnativewindow.so", RTLD_NOW | RTLD_GLOBAL);
++        if (lib)
++            set_frame_rate = dlsym(lib, "ANativeWindow_setFrameRate");
++        resolved = true;
++    }
++    return set_frame_rate;
++}
++
++// Vote the presentation cadence on the video Surface so SurfaceFlinger can
++// pick a matching refresh rate and pace latching. Seamless-only by design
++// (the API 30 entry point never switches modes non-seamlessly); the embedder
++// owns deliberate display-mode changes. Mirrors MediaCodecVideoRenderer's
++// FIXED_SOURCE vote, but derives the rate from mpv's speed-adjusted frame
++// duration, so speeded playback votes what is actually presented.
++static void update_frame_rate_hint(struct vo *vo, struct vo_frame *frame)
++{
++    struct priv *p = vo->priv;
++    if (!p->video_window || p->hint_failed || frame->duration <= 0)
++        return;
++    mp_set_frame_rate_fn set_frame_rate = get_set_frame_rate();
++    if (!set_frame_rate)
++        return;
++
++    float fps = (float)(1e9 / frame->duration);
++    if (fps < 1.0f || fps > 1000.0f)
++        return;
++    // Estimated durations jitter; re-vote only on a real change, and at most
++    // twice a second so VFR content does not spam SurfaceFlinger.
++    int64_t now = mp_time_ns();
++    if (p->voted_fps > 0 && (fabsf(fps - p->voted_fps) < 0.01f ||
++                             now - p->last_vote_ns < MP_TIME_MS_TO_NS(500)))
++        return;
++
++    if (set_frame_rate(p->video_window, fps,
++                       ANDROID_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE) != 0) {
++        MP_VERBOSE(vo, "Frame rate hint rejected; disabling.\n");
++        p->hint_failed = true;
++        return;
++    }
++    p->voted_fps = fps;
++    p->last_vote_ns = now;
++    MP_VERBOSE(vo, "Frame rate hint: %.3f fps\n", fps);
++}
 +
 +static AVBufferRef *create_mediacodec_device_ref(struct vo *vo)
 +{
@@ -352,6 +427,7 @@ index 0000000..95e4aec
 +    struct priv *p = vo->priv;
 +
 +    if (!frame->redraw && !frame->repeat) {
++        update_frame_rate_hint(vo, frame);
 +        talloc_free(p->cur_image);
 +        p->cur_image = frame->current ? mp_image_new_ref(frame->current) : NULL;
 +        p->cur_pts = frame->pts;
@@ -409,6 +485,18 @@ index 0000000..95e4aec
 +{
 +    struct priv *p = vo->priv;
 +    p->osd_force_full = true;
++
++    // Wrapped for the frame-rate vote only; MediaCodec stays the sole producer.
++    if (!p->video_window) {
++        JNIEnv *env = mp_jni_get_env(vo->log);
++        if (env) {
++            p->video_window = ANativeWindow_fromSurface(env,
++                    (jobject)(intptr_t)vo->opts->WinID);
++        }
++    }
++    p->voted_fps = 0; // re-vote per format; cadence may change
++
++    mp_image_unrefp(&p->cur_image);
 +    return 0;
 +}
 +
@@ -422,6 +510,14 @@ index 0000000..95e4aec
 +
 +    if (p->osd_window)
 +        ANativeWindow_release(p->osd_window);
++    if (p->video_window) {
++        // Clear our frame-rate vote; the Surface layer outlives this vo.
++        mp_set_frame_rate_fn set_frame_rate = get_set_frame_rate();
++        if (set_frame_rate && p->voted_fps > 0)
++            set_frame_rate(p->video_window, 0.0f,
++                           ANDROID_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
++        ANativeWindow_release(p->video_window);
++    }
 +}
 +
 +#define OPT_BASE_STRUCT struct priv
